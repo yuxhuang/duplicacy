@@ -39,6 +39,31 @@ func CreateRateLimitedReader(content []byte, rate int) (*RateLimitedReader) {
     }
 }
 
+func IsEmptyFilter(pattern string) bool {
+    if pattern == "+" || pattern == "-" || pattern == "i:" || pattern == "e:" {
+        return true
+    } else {
+        return false
+    }
+}
+
+func IsUnspecifiedFilter(pattern string) bool {
+    if pattern[0] != '+' && pattern[0] != '-' && pattern[0] != 'i' && pattern[0] != 'e' {
+        return true
+    } else {
+        return false
+    }
+}
+
+func IsValidRegex(pattern string) (valid bool, err error) {
+    _, err = regexp.Compile(pattern)
+    if err != nil {
+        return false, err
+    } else {
+        return true, err
+    }
+}
+
 func (reader *RateLimitedReader) Length() (int64) {
     return int64(len(reader.Content))
 }
@@ -118,10 +143,8 @@ func GenerateKeyFromPassword(password string) []byte {
     return pbkdf2.Key([]byte(password), DEFAULT_KEY, 16384, 32, sha256.New)
 }
 
-// GetPassword attempts to get the password from KeyChain/KeyRing, environment variables, or keyboard input.
-func GetPassword(preference Preference, passwordType string, prompt string,
-                 showPassword bool, resetPassword bool) (string) {
-
+// Get password from preference, env, but don't start any keyring request
+func GetPasswordFromPreference(preference Preference, passwordType string) (string) {
     passwordID := passwordType
     if preference.Name != "default" {
         passwordID = preference.Name + "_" + passwordID
@@ -135,9 +158,33 @@ func GetPassword(preference Preference, passwordType string, prompt string,
         }
     }
 
+    // If the password is stored in the preference, there is no need to include the storage name
+    // (i.e., preference.Name) in the key, so the key name should really be passwordType rather
+    // than passwordID; we're using passwordID here only for backward compatibility
     if len(preference.Keys) > 0 && len(preference.Keys[passwordID]) > 0 {
         LOG_DEBUG("PASSWORD_KEYCHAIN", "Reading %s from preferences", passwordID)
         return preference.Keys[passwordID]
+    }
+
+    if len(preference.Keys) > 0 && len(preference.Keys[passwordType]) > 0 {
+        LOG_DEBUG("PASSWORD_KEYCHAIN", "Reading %s from preferences", passwordType)
+        return preference.Keys[passwordType]
+    }
+
+    return ""
+}
+
+// GetPassword attempts to get the password from KeyChain/KeyRing, environment variables, or keyboard input.
+func GetPassword(preference Preference, passwordType string, prompt string,
+                 showPassword bool, resetPassword bool) (string) {
+    passwordID := passwordType
+    password := GetPasswordFromPreference(preference,passwordType)
+    if password != "" {
+        return password
+    }
+
+    if preference.Name != "default" {
+        passwordID = preference.Name + "_" + passwordID
     }
 
     if resetPassword && !RunInBackground {
@@ -155,7 +202,7 @@ func GetPassword(preference Preference, passwordType string, prompt string,
 
     }
 
-    password := ""
+    password = ""
     fmt.Printf("%s", prompt)
     if showPassword {
         scanner := bufio.NewScanner(os.Stdin)
@@ -175,6 +222,7 @@ func GetPassword(preference Preference, passwordType string, prompt string,
 
 // SavePassword saves the specified password in the keyring/keychain.
 func SavePassword(preference Preference, passwordType string, password string) {
+
     if password == "" || RunInBackground {
         return
     }
@@ -182,6 +230,12 @@ func SavePassword(preference Preference, passwordType string, password string) {
     if preference.DoNotSavePassword {
         return
     }
+
+    // If the password is retrieved from env or preference, don't save it to keyring
+    if GetPasswordFromPreference(preference, passwordType) == password {
+        return
+    }
+
     passwordID := passwordType
     if preference.Name != "default" {
         passwordID = preference.Name + "_" + passwordID
@@ -269,6 +323,25 @@ func MatchPath(filePath string, patterns [] string) (included bool) {
         } else if pattern[0] == '-' {
             allIncludes = false
              if matchPattern(filePath, pattern[1:]) {
+                return false
+            }
+        } else if strings.HasPrefix(pattern, "i:") {
+            matched, err := regexp.MatchString(pattern[2:], filePath)
+            if err != nil {
+                LOG_ERROR("SNAPSHOT_MATCH", "Error during regexp match: %s - %v", pattern, err)
+            }
+            if matched {
+                LOG_TRACE("SNAPSHOT_MATCH", "Regex include comparison for filePath=\"%s\", pattern=\"%s\", matched=%t", filePath, pattern[2:], matched)
+                return true
+            }
+        } else if strings.HasPrefix(pattern, "e:") {
+            allIncludes = false
+            matched, err := regexp.MatchString(pattern[2:], filePath)
+            if err != nil {
+                LOG_ERROR("SNAPSHOT_MATCH", "Error during regexp match: %s - %v", pattern, err)
+            }
+            if matched {
+                LOG_TRACE("SNAPSHOT_MATCH", "Regex exclude comparison for filePath=\"%s\", pattern=\"%s\", matched=%t", filePath, pattern[2:], matched)
                 return false
             }
         }

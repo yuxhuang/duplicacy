@@ -761,6 +761,7 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
         for _, file := range remoteSnapshot.Files {
 
             if MatchPath(file.Path, patterns) {
+                LOG_TRACE("RESTORE_INCLUDE", "Include %s", file.Path)
                 includedFiles = append(includedFiles, file)
             } else {
                 LOG_TRACE("RESTORE_EXCLUDE", "Exclude %s", file.Path)
@@ -1484,14 +1485,26 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
         return false
     }
 
-    revisionMap := make(map[int]bool)
+    if snapshotID == "" && len(revisionsToBeCopied) > 0 {
+        LOG_ERROR("SNAPSHOT_ERROR", "You must specify the snapshot id when one or more revisions are specified.")
+        return false
+    }
+
+    revisionMap := make(map[string]map[int]bool)
+
+    _, found := revisionMap[snapshotID]
+    if !found {
+        revisionMap[snapshotID] = make(map[int]bool)
+    }
+
     for _, revision := range revisionsToBeCopied {
-        revisionMap[revision] = true
+        revisionMap[snapshotID][revision] = true
     }
 
     var snapshots [] *Snapshot
     var snapshotIDs [] string
     var err error
+
     if snapshotID == "" {
         snapshotIDs, err = manager.SnapshotManager.ListSnapshotIDs()
         if err != nil {
@@ -1503,6 +1516,10 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
     }
 
     for _, id := range snapshotIDs {
+        _, found := revisionMap[id]
+        if !found {
+            revisionMap[id] = make(map[int]bool)
+        }
         revisions, err := manager.SnapshotManager.ListSnapshotRevisions(id)
         if err != nil {
             LOG_ERROR("SNAPSHOT_LIST", "Failed to list all revisions for snapshot %s: %v", id, err)
@@ -1511,9 +1528,14 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
 
         for _, revision := range revisions {
             if len(revisionsToBeCopied) > 0 {
-                if _, found := revisionMap[revision]; !found {
+                if _, found := revisionMap[id][revision]; found {
+                    revisionMap[id][revision] = true
+                } else {
+                    revisionMap[id][revision] = false
                     continue
                 }
+            } else {
+                revisionMap[id][revision] = true
             }
 
             snapshotPath := fmt.Sprintf("snapshots/%s/%d", id, revision)
@@ -1525,31 +1547,50 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
             }
 
             if exist {
-                LOG_INFO("SNAPSHOT_EXIST", "Snapshot %s at revision %d already exists in the destination storage",
+                LOG_INFO("SNAPSHOT_EXIST", "Snapshot %s at revision %d already exists at the destination storage",
                           id, revision)
+                revisionMap[id][revision] = false
                 continue
             }
 
             snapshot := manager.SnapshotManager.DownloadSnapshot(id, revision)
             snapshots = append(snapshots, snapshot)
         }
+
+    }
+
+    if len(snapshots) == 0 {
+        LOG_INFO("SNAPSHOT_COPY", "Nothing to copy, all snapshot revisions exist at the destination.")
+        return true
     }
 
     chunks := make(map[string]bool)
+    otherChunks := make(map[string]bool)
 
     for _, snapshot := range snapshots {
 
+        if revisionMap[snapshot.ID][snapshot.Revision] == false {
+            continue
+        }
+
         LOG_TRACE("SNAPSHOT_COPY", "Copying snapshot %s at revision %d", snapshot.ID, snapshot.Revision)
+
         for _, chunkHash := range snapshot.FileSequence {
-            chunks[chunkHash] = true
+            if _, found := chunks[chunkHash]; !found {
+                chunks[chunkHash] = true
+            }
         }
 
         for _, chunkHash := range snapshot.ChunkSequence {
-            chunks[chunkHash] = true
+            if _, found := chunks[chunkHash]; !found {
+                chunks[chunkHash] = true
+            }
         }
 
         for _, chunkHash := range snapshot.LengthSequence {
-            chunks[chunkHash] = true
+            if _, found := chunks[chunkHash]; !found {
+                chunks[chunkHash] = true
+            }
         }
 
         description := manager.SnapshotManager.DownloadSequence(snapshot.ChunkSequence)
@@ -1561,46 +1602,92 @@ func (manager *BackupManager) CopySnapshots(otherManager *BackupManager, snapsho
         }
 
         for _, chunkHash := range snapshot.ChunkHashes {
-            chunks[chunkHash] = true
+            if _, found := chunks[chunkHash]; !found {
+                chunks[chunkHash] = true
+            }
         }
     }
+
+    otherChunkFiles, otherChunkSizes := otherManager.SnapshotManager.ListAllFiles(otherManager.storage, "chunks/")
+
+    for i, otherChunkID := range otherChunkFiles {
+        otherChunkID = strings.Replace(otherChunkID, "/", "", -1)
+        if len(otherChunkID) != 64 {
+            continue
+        }
+        if otherChunkSizes[i] == 0 {
+            LOG_DEBUG("SNAPSHOT_COPY", "Chunk %s has length = 0", otherChunkID)
+            continue
+        }
+        otherChunks[otherChunkID] = false
+    }
+
+    LOG_DEBUG("SNAPSHOT_COPY", "Found %d chunks on destination storage", len(otherChunks))
+
+    chunksToCopy := 0
+    chunksToSkip := 0
+
+    for chunkHash, _ := range chunks {
+        otherChunkID := otherManager.config.GetChunkIDFromHash(chunkHash)
+        if _, found := otherChunks[otherChunkID]; found {
+            chunksToSkip++
+        } else {
+            chunksToCopy++
+        }
+    }
+
+    LOG_DEBUG("SNAPSHOT_COPY", "Chunks to copy = %d, to skip = %d, total = %d", chunksToCopy, chunksToSkip, chunksToCopy + chunksToSkip)
+    LOG_DEBUG("SNAPSHOT_COPY", "Total chunks in source snapshot revisions = %d\n", len(chunks))
 
     chunkDownloader := CreateChunkDownloader(manager.config, manager.storage, nil, false, threads)
 
     chunkUploader := CreateChunkUploader(otherManager.config, otherManager.storage, nil, threads,
         func(chunk *Chunk, chunkIndex int, skipped bool, chunkSize int, uploadSize int) {
             if skipped {
-                LOG_INFO("SNAPSHOT_COPY", "Chunk %s (%d/%d) exists in the destination", chunk.GetID(), chunkIndex, len(chunks))
+                LOG_INFO("SNAPSHOT_COPY", "Chunk %s (%d/%d) exists at the destination", chunk.GetID(), chunkIndex, len(chunks))
             } else {
-                LOG_INFO("SNAPSHOT_COPY", "Copied chunk %s (%d/%d)", chunk.GetID(), chunkIndex, len(chunks))
+                LOG_INFO("SNAPSHOT_COPY", "Chunk %s (%d/%d) copied to the destination", chunk.GetID(), chunkIndex, len(chunks))
             }
             otherManager.config.PutChunk(chunk)
         })
+
     chunkUploader.Start()
 
+    totalCopied := 0
+    totalSkipped := 0
     chunkIndex := 0
+
     for chunkHash, _ := range chunks {
         chunkIndex++
         chunkID := manager.config.GetChunkIDFromHash(chunkHash)
         newChunkID := otherManager.config.GetChunkIDFromHash(chunkHash)
-
-        LOG_DEBUG("SNAPSHOT_COPY", "Copying chunk %s to %s", chunkID, newChunkID)
-
-        i := chunkDownloader.AddChunk(chunkHash)
-        chunk := chunkDownloader.WaitForChunk(i)
-        newChunk := otherManager.config.GetChunk()
-        newChunk.Reset(true)
-        newChunk.Write(chunk.GetBytes())
-        chunkUploader.StartChunk(newChunk, chunkIndex)
+        if _, found := otherChunks[newChunkID]; !found {
+            LOG_DEBUG("SNAPSHOT_COPY", "Copying chunk %s to %s", chunkID, newChunkID)
+            i := chunkDownloader.AddChunk(chunkHash)
+            chunk := chunkDownloader.WaitForChunk(i)
+            newChunk := otherManager.config.GetChunk()
+            newChunk.Reset(true)
+            newChunk.Write(chunk.GetBytes())
+            chunkUploader.StartChunk(newChunk, chunkIndex)
+            totalCopied++
+        } else {
+            LOG_INFO("SNAPSHOT_COPY", "Chunk %s (%d/%d) skipped at the destination", chunkID, chunkIndex, len(chunks))
+            totalSkipped++
+        }
     }
 
     chunkDownloader.Stop()
     chunkUploader.Stop()
 
+    LOG_INFO("SNAPSHOT_COPY", "Copy complete, %d total chunks, %d chunks copied, %d skipped", totalCopied + totalSkipped, totalCopied, totalSkipped)
+
     for _, snapshot := range snapshots {
-        otherManager.storage.CreateDirectory(0, fmt.Sprintf("snapshots/%s", manager.snapshotID))
+        if revisionMap[snapshot.ID][snapshot.Revision] == false {
+            continue
+        }
+        otherManager.storage.CreateDirectory(0, fmt.Sprintf("snapshots/%s", snapshot.ID))
         description, _ := snapshot.MarshalJSON()
-        path := fmt.Sprintf("snapshots/%s/%d", manager.snapshotID, snapshot.Revision)
+        path := fmt.Sprintf("snapshots/%s/%d", snapshot.ID, snapshot.Revision)
         otherManager.SnapshotManager.UploadFile(path, path, description)
         LOG_INFO("SNAPSHOT_COPY", "Copied snapshot %s at revision %d", snapshot.ID, snapshot.Revision)
     }

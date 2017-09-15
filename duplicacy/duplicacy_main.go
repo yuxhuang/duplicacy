@@ -679,6 +679,8 @@ func restoreRepository(context *cli.Context) {
     var patterns [] string
     for _, pattern := range context.Args() {
 
+        pattern = strings.TrimSpace(pattern)
+
         for strings.HasPrefix(pattern, "--") {
             pattern = pattern[1:]
         }
@@ -687,12 +689,19 @@ func restoreRepository(context *cli.Context) {
             pattern = pattern[1:]
         }
 
-        if pattern[0] != '+' && pattern[0] != '-' {
+        if duplicacy.IsUnspecifiedFilter(pattern) {
             pattern = "+" + pattern
         }
 
-        if pattern == "+" || pattern == "-" {
+        if duplicacy.IsEmptyFilter(pattern) {
             continue
+        }
+
+        if strings.HasPrefix(pattern, "i:") || strings.HasPrefix(pattern, "e:") {
+            valid, err := duplicacy.IsValidRegex(pattern[2:])
+            if  !valid || err != nil {
+                duplicacy.LOG_ERROR("SNAPSHOT_FILTER", "Invalid regular expression encountered for filter: \"%s\", error: %v", pattern, err)
+            }
         }
 
         patterns = append(patterns, pattern)
@@ -1020,12 +1029,17 @@ func copySnapshots(context *cli.Context) {
         os.Exit(ArgumentExitCode)
     }
 
+    threads := context.Int("threads")
+    if threads < 1 {
+        threads = 1
+    }
+
     repository, source := getRepositoryPreference(context, context.String("from"))
 
     runScript(context, source.Name, "pre")
 
     duplicacy.LOG_INFO("STORAGE_SET", "Source storage set to %s", source.StorageURL)
-    sourceStorage := duplicacy.CreateStorage(*source, false, 1)
+    sourceStorage := duplicacy.CreateStorage(*source, false, threads)
     if sourceStorage == nil {
         return
     }
@@ -1055,7 +1069,7 @@ func copySnapshots(context *cli.Context) {
 
 
     duplicacy.LOG_INFO("STORAGE_SET", "Destination storage set to %s", destination.StorageURL)
-    destinationStorage := duplicacy.CreateStorage(*destination, false, 1)
+    destinationStorage := duplicacy.CreateStorage(*destination, false, threads)
     if destinationStorage == nil {
         return
     }
@@ -1066,8 +1080,8 @@ func copySnapshots(context *cli.Context) {
                                                     "Enter destination storage password:",false, false)
     }
 
-    sourceStorage.SetRateLimits(context.Int("download-rate-limit"), 0)
-    destinationStorage.SetRateLimits(0, context.Int("upload-rate-limit"))
+    sourceStorage.SetRateLimits(context.Int("download-limit-rate"), 0)
+    destinationStorage.SetRateLimits(0, context.Int("upload-limit-rate"))
 
     destinationManager := duplicacy.CreateBackupManager(destination.SnapshotID, destinationStorage, repository,
                                                         destinationPassword)
@@ -1078,11 +1092,6 @@ func copySnapshots(context *cli.Context) {
     snapshotID := ""
     if context.String("id") != "" {
         snapshotID = context.String("id")
-    }
-
-    threads := context.Int("threads")
-    if threads < 1 {
-        threads = 1
     }
 
     sourceManager.CopySnapshots(destinationManager, snapshotID, revisions, threads)
@@ -1477,7 +1486,7 @@ func main() {
                 },
                 cli.BoolFlag {
                     Name: "delete-only",
-                    Usage: "delete fossils previsouly collected (if deletable) and don't collect fossils",
+                    Usage: "delete fossils previously collected (if deletable) and don't collect fossils",
                 },
                 cli.BoolFlag {
                     Name: "collect-only",
@@ -1695,7 +1704,7 @@ func main() {
     app.Name = "duplicacy"
     app.HelpName = "duplicacy"
     app.Usage = "A new generation cloud backup tool based on lock-free deduplication"
-    app.Version = "2.0.8"
+    app.Version = "2.0.9"
 
     // If the program is interrupted, call the RunAtError function.
     c := make(chan os.Signal, 1)                                       
